@@ -1,201 +1,165 @@
+# main.py
 import os
 import json
-import random
 import asyncio
-
-from telegram import Update, ChatInviteLink
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+import random
+from pathlib import Path
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
 DATA_FILE = "data.json"
+DEFAULT_DELAY = 2  # seconds
 
+# Load bot token and owner id from environment (Replit Secrets)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 if not BOT_TOKEN or not OWNER_ID:
-    print("BOT_TOKEN ya OWNER_ID set karo environment vars me")
-    exit(1)
+    raise SystemExit("Error: Set BOT_TOKEN and OWNER_ID as environment variables (Replit Secrets).")
 
-default_data = {
-    "sudos": [OWNER_ID],
-    "auto_reply_enabled": False,
-    "auto_replies": ["Hello! Bot ready."],
-    "name_change_enabled": False,
-    "allowed_exec": ["whoami", "ls", "pwd"],
-}
-
+# Storage helpers
 def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return default_data.copy()
+    p = Path(DATA_FILE)
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+    return {}  # mapping: chat_id_str -> {enabled:bool, delay_seconds:int, auto_replies:list}
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def save_data(d):
+    Path(DATA_FILE).write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
 
 data = load_data()
 
-def is_sudo(user_id: int) -> bool:
-    return user_id in data.get("sudos", [])
+def get_chat_cfg(chat_id: int):
+    key = str(chat_id)
+    cfg = data.get(key)
+    if not cfg:
+        cfg = {"enabled": False, "delay_seconds": DEFAULT_DELAY, "auto_replies": ["Hi! I'm here."]}
+        data[key] = cfg
+        save_data(data)
+    return cfg
+
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+# --- Commands ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot is online!")
+    await update.message.reply_text("Bot online. Owner can use /enable in a group to activate features.")
 
-async def addsudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return await update.message.reply_text("⛔ Unauthorized")
-    if not context.args:
-        return await update.message.reply_text("Usage: /addsudo <user_id>")
-    try:
-        new_id = int(context.args[0])
-        if new_id in data["sudos"]:
-            return await update.message.reply_text("User already sudo.")
-        data["sudos"].append(new_id)
-        save_data(data)
-        await update.message.reply_text(f"✅ Added sudo: {new_id}")
-    except:
-        await update.message.reply_text("Invalid ID.")
-
-async def remsudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return await update.message.reply_text("⛔ Unauthorized")
-    if not context.args:
-        return await update.message.reply_text("Usage: /remsudo <user_id>")
-    try:
-        rid = int(context.args[0])
-        if rid in data["sudos"]:
-            data["sudos"].remove(rid)
-            save_data(data)
-            await update.message.reply_text(f"✅ Removed sudo: {rid}")
-        else:
-            await update.message.reply_text("User not sudo.")
-    except:
-        await update.message.reply_text("Invalid ID.")
-
-async def listsudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lst = "\n".join(str(x) for x in data.get("sudos", []))
-    await update.message.reply_text("Sudo users:\n" + lst)
-
-async def toggle_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return await update.message.reply_text("⛔ Unauthorized")
-    data["auto_reply_enabled"] = not data.get("auto_reply_enabled", False)
+async def enable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_owner(user.id):
+        return await update.message.reply_text("⛔ Only the owner can enable the bot for this group.")
+    if update.effective_chat.type == "private":
+        return await update.message.reply_text("Use this command inside a group where you want the bot active.")
+    cfg = get_chat_cfg(update.effective_chat.id)
+    cfg["enabled"] = True
     save_data(data)
-    await update.message.reply_text(f"Auto-reply {'enabled' if data['auto_reply_enabled'] else 'disabled'}")
+    await update.message.reply_text("✅ Bot features enabled for this group.")
+
+async def disable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_owner(user.id):
+        return await update.message.reply_text("⛔ Only the owner can disable the bot for this group.")
+    if update.effective_chat.type == "private":
+        return await update.message.reply_text("Use this command inside the target group.")
+    cfg = get_chat_cfg(update.effective_chat.id)
+    cfg["enabled"] = False
+    save_data(data)
+    await update.message.reply_text("⛔ Bot features disabled for this group.")
+
+async def setdelay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_owner(user.id):
+        return await update.message.reply_text("⛔ Only the owner can set delay.")
+    if update.effective_chat.type == "private":
+        return await update.message.reply_text("Use this inside the target group.")
+    if not context.args:
+        return await update.message.reply_text("Usage: /setdelay <seconds> (e.g. /setdelay 3)")
+    try:
+        sec = float(context.args[0])
+        if sec < 0:
+            raise ValueError
+    except:
+        return await update.message.reply_text("Invalid seconds. Use a non-negative number.")
+    cfg = get_chat_cfg(update.effective_chat.id)
+    cfg["delay_seconds"] = sec
+    save_data(data)
+    await update.message.reply_text(f"⏱️ Reply delay set to {sec} seconds for this group.")
 
 async def addreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return await update.message.reply_text("⛔ Unauthorized")
-    txt = " ".join(context.args)
-    if not txt:
-        return await update.message.reply_text("Usage: /addreply <message>")
-    data["auto_replies"].append(txt)
+    user = update.effective_user
+    if not is_owner(user.id):
+        return await update.message.reply_text("⛔ Only the owner can add replies.")
+    if update.effective_chat.type == "private":
+        return await update.message.reply_text("Use this inside the target group.")
+    text = " ".join(context.args).strip()
+    if not text:
+        return await update.message.reply_text("Usage: /addreply <text>")
+    cfg = get_chat_cfg(update.effective_chat.id)
+    cfg.setdefault("auto_replies", []).append(text)
     save_data(data)
     await update.message.reply_text("✅ Auto-reply added.")
 
 async def rmreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return await update.message.reply_text("⛔ Unauthorized")
+    user = update.effective_user
+    if not is_owner(user.id):
+        return await update.message.reply_text("⛔ Only the owner can remove replies.")
+    if update.effective_chat.type == "private":
+        return await update.message.reply_text("Use this inside the target group.")
     if not context.args:
         return await update.message.reply_text("Usage: /rmreply <index>")
     try:
         idx = int(context.args[0])
-        removed = data["auto_replies"].pop(idx)
+        cfg = get_chat_cfg(update.effective_chat.id)
+        removed = cfg["auto_replies"].pop(idx)
         save_data(data)
         await update.message.reply_text(f"Removed reply: {removed}")
-    except:
+    except Exception as e:
         await update.message.reply_text("Invalid index.")
 
 async def listreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = [f"{i}: {msg}" for i, msg in enumerate(data.get("auto_replies", []))]
-    await update.message.reply_text("Auto-replies:\n" + ("\n".join(lines) if lines else "None"))
+    cfg = get_chat_cfg(update.effective_chat.id)
+    lines = [f"{i}: {t}" for i, t in enumerate(cfg.get("auto_replies", []))]
+    text = "Auto replies:\n" + ("\n".join(lines) if lines else "No replies set.")
+    await update.message.reply_text(text)
 
-async def togglename(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return await update.message.reply_text("⛔ Unauthorized")
-    data["name_change_enabled"] = not data.get("name_change_enabled", False)
-    save_data(data)
-    await update.message.reply_text(f"Group name change {'enabled' if data['name_change_enabled'] else 'disabled'}")
-
-async def setname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return await update.message.reply_text("⛔ Unauthorized")
-    if not data.get("name_change_enabled"):
-        return await update.message.reply_text("Name change disabled. Use /togglename first.")
-    if not context.args:
-        return await update.message.reply_text("Usage: /setname <new name>")
-    new_name = " ".join(context.args)
-    try:
-        await context.bot.set_chat_title(update.effective_chat.id, new_name)
-        await update.message.reply_text(f"✅ New name: {new_name}")
-    except Exception as e:
-        await update.message.reply_text(f"Error changing name: {e}")
-
-async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return await update.message.reply_text("⛔ Unauthorized")
-    try:
-        link = await context.bot.create_chat_invite_link(chat_id=update.effective_chat.id)
-        await update.message.reply_text(f"Invite link:\n{link.invite_link}")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
-async def kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_sudo(update.effective_user.id):
-        return await update.message.reply_text("⛔ Unauthorized")
-    target_id = None
-    if update.message.reply_to_message:
-        target_id = update.message.reply_to_message.from_user.id
-    elif context.args:
-        try:
-            if context.args[0].startswith("@"):
-                member = await context.bot.get_chat_member(update.effective_chat.id, context.args[0])
-                target_id = member.user.id
-            else:
-                target_id = int(context.args[0])
-        except:
-            pass
-    if not target_id:
-        return await update.message.reply_text("Usage: /kick <user_id or @username> or reply to user")
-    try:
-        await context.bot.ban_chat_member(update.effective_chat.id, target_id)
-        await update.message.reply_text(f"✅ Kicked {target_id}")
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
-
+# --- Auto reply behavior ---
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and not update.message.text.startswith("/"):
-        if data.get("auto_reply_enabled"):
-            await update.message.reply_text(random.choice(data.get("auto_replies", ["Hi!"])))
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    if msg.text.startswith("/"):
+        return  # skip commands
+    chat = update.effective_chat
+    cfg = get_chat_cfg(chat.id)
+    if not cfg.get("enabled"):
+        return
+    # choose reply and wait for delay
+    reply = random.choice(cfg.get("auto_replies", ["Hello!"]))
+    delay = cfg.get("delay_seconds", DEFAULT_DELAY)
+    # Asynchronously sleep so the bot can handle other updates
+    await asyncio.sleep(delay)
+    try:
+        await msg.reply_text(reply)
+    except Exception:
+        pass
 
+# --- App setup ---
 def main():
-    from telegram.ext import ApplicationBuilder
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("addsudo", addsudo))
-    app.add_handler(CommandHandler("remsudo", remsudo))
-    app.add_handler(CommandHandler("listsudo", listsudo))
-    app.add_handler(CommandHandler("autoreply", toggle_autoreply))
+    app.add_handler(CommandHandler("enable", enable))
+    app.add_handler(CommandHandler("disable", disable))
+    app.add_handler(CommandHandler("setdelay", setdelay))
     app.add_handler(CommandHandler("addreply", addreply))
     app.add_handler(CommandHandler("rmreply", rmreply))
     app.add_handler(CommandHandler("listreply", listreply))
-    app.add_handler(CommandHandler("togglename", togglename))
-    app.add_handler(CommandHandler("setname", setname))
-    app.add_handler(CommandHandler("invite", invite))
-    app.add_handler(CommandHandler("kick", kick))
 
-    # message handler
-    app.add_handler(MessageHandler(filters.ALL & ~filters.Command, on_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    print("Bot is starting...")
+    print("Bot started")
     app.run_polling()
 
 if __name__ == "__main__":
